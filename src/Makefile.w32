@@ -27,7 +27,7 @@ GIFWRITE_OBJ = gifwrite.obj
 SETARGV_OBJ = v:\lib\setargv.obj
 
 CC = cl
-CFLAGS = -I.. -I..\include -DHAVE_CONFIG_H -D_CONSOLE /W3 /O2
+CFLAGS = -I.. -I..\include -DHAVE_CONFIG_H -D_CONSOLE -DHAVE_UINTPTR_T /W3 /O2
 
 GIFSICLE_OBJS = clp.obj fmalloc.obj giffunc.obj gifread.obj gifunopt.obj \
 	$(GIFWRITE_OBJ) merge.obj optimize.obj quantize.obj support.obj \

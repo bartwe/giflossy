@@ -191,6 +191,8 @@ typedef struct gfc_rgbdiff {signed short r, g, b;} gfc_rgbdiff;
 /* Difference (MSE) between given color indexes + dithering error */
 static inline unsigned int color_diff(Gif_Color a, Gif_Color b, int a_transaprent, int b_transparent, gfc_rgbdiff dither)
 {
+  unsigned int dith;
+  unsigned int undith;
   /* if one is transparent and the other is not, then return maximum difference */
   /* TODO: figure out what color is in the canvas under the transparent pixel and match against that */
   if (a_transaprent != b_transparent) return 1<<25;
@@ -199,11 +201,11 @@ static inline unsigned int color_diff(Gif_Color a, Gif_Color b, int a_transapren
   if (a_transaprent) return 0;
 
   /* squared error with or without dithering. */
-  unsigned int dith = (a.gfc_red-b.gfc_red+dither.r)*(a.gfc_red-b.gfc_red+dither.r)
+  dith = (a.gfc_red-b.gfc_red+dither.r)*(a.gfc_red-b.gfc_red+dither.r)
   + (a.gfc_green-b.gfc_green+dither.g)*(a.gfc_green-b.gfc_green+dither.g)
   + (a.gfc_blue-b.gfc_blue+dither.b)*(a.gfc_blue-b.gfc_blue+dither.b);
 
-  unsigned int undith = (a.gfc_red-b.gfc_red+dither.r/2)*(a.gfc_red-b.gfc_red+dither.r/2)
+  undith = (a.gfc_red-b.gfc_red+dither.r/2)*(a.gfc_red-b.gfc_red+dither.r/2)
   + (a.gfc_green-b.gfc_green+dither.g/2)*(a.gfc_green-b.gfc_green+dither.g/2)
   + (a.gfc_blue-b.gfc_blue+dither.b/2)*(a.gfc_blue-b.gfc_blue+dither.b/2);
 
@@ -214,13 +216,16 @@ static inline unsigned int color_diff(Gif_Color a, Gif_Color b, int a_transapren
 /* difference between expected color a+dither and color b (used to calculate dithering required) */
 static inline gfc_rgbdiff diffused_difference(Gif_Color a, Gif_Color b, int a_transaprent, int b_transaprent, gfc_rgbdiff dither)
 {
-  if (a_transaprent || b_transaprent) return (gfc_rgbdiff){0,0,0};
+  gfc_rgbdiff result;
+  if (a_transaprent || b_transaprent) {
+	result.r = 0; result.b = 0; result.g = 0;
+	return result;
+  }
 
-  return (gfc_rgbdiff) {
-    a.gfc_red - b.gfc_red + dither.r * 3/4,
-    a.gfc_green - b.gfc_green + dither.g * 3/4,
-    a.gfc_blue - b.gfc_blue + dither.b * 3/4,
-  };
+    result.r = a.gfc_red - b.gfc_red + dither.r * 3/4;
+    result.g = a.gfc_green - b.gfc_green + dither.g * 3/4;
+    result.b = a.gfc_blue - b.gfc_blue + dither.b * 3/4;
+	return result;
 }
 
 static inline const uint8_t gif_pixel_at_pos(Gif_Image *gfi, unsigned pos);
@@ -316,6 +321,7 @@ static void
 gfc_lookup_lossy(Gif_Image *gfi,
   unsigned pos, Gif_Node *node, unsigned long base_diff, gfc_rgbdiff dither, struct gif_lossy_search *search)
 {
+  uint8_t suffix;
   unsigned image_endpos = gfi->width * gfi->height;
 
   /* search is biased towards finding longest candidate that is below treshold rather than a match with minimum average error */
@@ -329,10 +335,11 @@ gfc_lookup_lossy(Gif_Image *gfi,
     return;
   }
 
-  uint8_t suffix = gif_pixel_at_pos(gfi, pos);
+  suffix = gif_pixel_at_pos(gfi, pos);
   if (!node) {
     /* prefix of the new node must be same as suffix of previously added node */
-    gfc_lookup_lossy(gfi, pos+1, &search->gfc->nodes[suffix], base_diff, (gfc_rgbdiff){0,0,0}, search);
+	gfc_rgbdiff zero; zero.r = 0; zero.g = 0; zero.b = 0;
+    gfc_lookup_lossy(gfi, pos+1, &search->gfc->nodes[suffix], base_diff, zero, search);
     return;
   }
 
@@ -414,6 +421,9 @@ write_compressed_data(Gif_Stream *gfs, Gif_Image *gfi,
   uint8_t suffix;
 
   int cur_code_bits;
+  Gif_Colormap *gfcm;
+  struct gif_lossy_search lossy_search;
+  gfc_rgbdiff zero;
 
   /* Here we go! */
   gifputbyte(min_code_bits, grr);
@@ -432,8 +442,6 @@ write_compressed_data(Gif_Stream *gfs, Gif_Image *gfi,
   /* Because output_code is clear_code, we'll initialize next_code, et al.
      below. */
 
-  Gif_Colormap *gfcm;
-
   pos = clear_pos = clear_bufpos = 0;
   if (grr->gcinfo.loss) {
     image_endpos = gfi->height * gfi->width;
@@ -443,7 +451,14 @@ write_compressed_data(Gif_Stream *gfs, Gif_Image *gfi,
     imageline = gif_imageline(gfi, pos);
   }
 
-  struct gif_lossy_search lossy_search = {gfc, gfcm, NULL, pos, 0, grr->gcinfo.loss * 10};
+  lossy_search.gfc = gfc;
+  lossy_search.gfcm = gfcm;
+  lossy_search.best_node = NULL;
+  lossy_search.best_pos = pos;
+  lossy_search.best_diff = 0;
+  lossy_search.max_diff = grr->gcinfo.loss * 10;
+  lossy_search.start_pos = 0; // wasn't intialized before
+  
   while (1) {
 
     /*****
@@ -501,8 +516,9 @@ write_compressed_data(Gif_Stream *gfs, Gif_Image *gfi,
       lossy_search.best_node = NULL;
       lossy_search.best_pos = lossy_search.start_pos = pos;
       lossy_search.best_diff = 0;
-
-      gfc_lookup_lossy(gfi, pos, NULL, 0, (gfc_rgbdiff){0,0,0}, &lossy_search);
+      zero.r = 0; zero.g = 0; zero.b = 0;
+	  
+      gfc_lookup_lossy(gfi, pos, NULL, 0, zero, &lossy_search);
 
       work_node = lossy_search.best_node;
       run = lossy_search.best_pos - pos;
@@ -1128,6 +1144,8 @@ Gif_WriteStart(Gif_Stream *gfs, const Gif_CompressInfo *gcinfo, FILE *f, uint8_t
 int
 Gif_WriteImage(Gif_Stream *gfs, Gif_Writer *grr, Gif_Image *gfi, const Gif_CompressInfo *gcinfo)
 {
+  Gif_CodeTable gfc;
+  int ok;
   int i = Gif_ImageNumber(gfs, gfi);
   if (i < 0) {
     if (!Gif_AddImage(gfs, gfi))
@@ -1135,7 +1153,6 @@ Gif_WriteImage(Gif_Stream *gfs, Gif_Writer *grr, Gif_Image *gfi, const Gif_Compr
     i = gfs->nimages-1;
   }
 
-  Gif_CodeTable gfc;
   if (!gfc_init(&gfc))
     return 0;
 
@@ -1143,7 +1160,7 @@ Gif_WriteImage(Gif_Stream *gfs, Gif_Writer *grr, Gif_Image *gfi, const Gif_Compr
     grr->gcinfo = *gcinfo;
   }
 
-  int ok = write_gif_write_image_and_extensions(gfs, grr, &gfc, gfi, i);
+  ok = write_gif_write_image_and_extensions(gfs, grr, &gfc, gfi, i);
 
   gfc_deinit(&gfc);
   return ok;
@@ -1155,15 +1172,18 @@ Gif_FullWriteFile(Gif_Stream *gfs, const Gif_CompressInfo *gcinfo,
 {
 
   Gif_CodeTable gfc;
+  Gif_Writer *grr;
+  int ok;
+  int i;
+  
   if (!gfc_init(&gfc))
     return 0;
 
-  Gif_Writer *grr = Gif_WriteStart(gfs, gcinfo, f, write_gif_isgif89a(gfs));
+  grr = Gif_WriteStart(gfs, gcinfo, f, write_gif_isgif89a(gfs));
   if (!grr)
     return 0;
 
-  int ok = 0;
-  int i;
+  ok = 0;
   for (i = 0; i < gfs->nimages; i++) {
     ok = write_gif_write_image_and_extensions(gfs, grr, &gfc, gfs->images[i], i);
     if (!ok) break;
