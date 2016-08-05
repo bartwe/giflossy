@@ -21,8 +21,9 @@
 # include <unistd.h>
 #endif
 
+#ifndef static_assert
 #define static_assert(x, msg) switch ((int) (x)) case 0: case !!((int) (x)):
-
+#endif
 
 Gt_Frame def_frame;
 
@@ -33,6 +34,9 @@ Gt_Frameset *nested_frames = 0;
 Gif_Stream *input = 0;
 const char *input_name = 0;
 static int unoptimizing = 0;
+
+const int GIFSICLE_DEFAULT_THREAD_COUNT = 8;
+int thread_count = 0;
 
 static int gif_read_flags = 0;
 static int nextfile = 0;
@@ -51,15 +55,17 @@ int nested_mode = 0;
 
 static int infoing = 0;
 int verbosing = 0;
+static int no_ignore_errors = 0;
 
 
 #define CHANGED(next, flag)	(((next) & (1<<(flag))) != 0)
 #define UNCHECKED_MARK_CH(where, what)			\
   next_##where |= 1<<what;
-#define MARK_CH(where, what)				\
+#define MARK_CH(where, what)    do {                        \
   if (CHANGED(next_##where, what))			\
     redundant_option_warning(where##_option_types[what]); \
-  UNCHECKED_MARK_CH(where, what)
+    UNCHECKED_MARK_CH(where, what);                         \
+  } while (0)
 
 /* frame option types */
 static int next_frame = 0;
@@ -187,6 +193,11 @@ static const char *output_option_types[] = {
 #define GRAY_OPT		369
 #define RESIZE_METHOD_OPT	370
 #define RESIZE_COLORS_OPT	371
+#define NO_APP_EXTENSIONS_OPT   372
+#define SAME_APP_EXTENSIONS_OPT 373
+#define IGNORE_ERRORS_OPT       374
+#define THREADS_OPT             375
+#define LOSSY_OPT		376
 
 #define LOOP_TYPE		(Clp_ValFirstUser)
 #define DISPOSAL_TYPE		(Clp_ValFirstUser + 1)
@@ -205,6 +216,7 @@ const Clp_Option options[] = {
 
   { "append", 0, APPEND_OPT, 0, 0 },
   { "app-extension", 'x', APP_EXTENSION_OPT, Clp_ValString, 0 },
+  { "no-app-extensions", 0, NO_APP_EXTENSIONS_OPT, 0, 0 },
 
   { "background", 'B', BACKGROUND_OPT, COLOR_TYPE, Clp_Negate },
   { "batch", 'b', 'b', 0, 0 },
@@ -233,6 +245,7 @@ const Clp_Option options[] = {
   { "explode", 'e', 'e', 0, 0 },
   { "explode-by-name", 'E', 'E', 0, 0 },
   { "extension", 0, EXTENSION_OPT, Clp_ValString, 0 },
+  { "no-extension", 0, NO_EXTENSIONS_OPT, 0, 0 },
   { "no-extensions", 'x', NO_EXTENSIONS_OPT, 0, 0 },
   { "extension-info", 0, EXTENSION_INFO_OPT, 0, Clp_Negate },
 
@@ -245,12 +258,14 @@ const Clp_Option options[] = {
 
   { "help", 'h', HELP_OPT, 0, 0 },
 
+  { "ignore-errors", 0, IGNORE_ERRORS_OPT, 0, Clp_Negate },
   { "info", 'I', INFO_OPT, 0, Clp_Negate },
   { "insert-before", 0, INSERT_OPT, FRAME_SPEC_TYPE, 0 },
   { "interlace", 'i', 'i', 0, Clp_Negate },
 
   { "logical-screen", 'S', LOGICAL_SCREEN_OPT, DIMENSIONS_TYPE, Clp_Negate },
   { "loopcount", 'l', 'l', LOOP_TYPE, Clp_Optional | Clp_Negate },
+  { "lossy", 0, LOSSY_OPT, Clp_ValInt, Clp_Optional },
 
   { "merge", 'm', 'm', 0, 0 },
   { "method", 0, COLORMAP_ALGORITHM_OPT, COLORMAP_ALG_TYPE, 0 },
@@ -284,6 +299,7 @@ const Clp_Option options[] = {
   { "rotate-270", 0, ROTATE_270_OPT, 0, 0 },
   { "no-rotate", 0, NO_ROTATE_OPT, 0, 0 },
 
+  { "same-app-extensions", 0, SAME_APP_EXTENSIONS_OPT, 0, 0 },
   { "same-background", 0, SAME_BACKGROUND_OPT, 0, 0 },
   { "same-bg", 0, SAME_BACKGROUND_OPT, 0, 0 },
   { "same-clip", 0, SAME_CROP_OPT, 0, 0 },
@@ -321,6 +337,7 @@ const Clp_Option options[] = {
   { "warnings", 0, WARNINGS_OPT, 0, Clp_Negate },
 
   { "xinfo", 0, EXTENSION_INFO_OPT, 0, Clp_Negate },
+  { "threads", 'j', THREADS_OPT, Clp_ValUnsigned, Clp_Optional | Clp_Negate },
 
 };
 
@@ -490,7 +507,9 @@ gifread_error(Gif_Stream* gfs, Gif_Image* gfi,
           || strcmp(landmark, last_landmark) != 0)) {
     const char* etype = last_is_error ? "read error: " : "";
     void (*f)(const char*, const char*, ...) = last_is_error ? lerror : lwarning;
-    if (same_error_count == 1)
+    if (gfi && gfi->user_flags)
+      /* error already reported */;
+    else if (same_error_count == 1)
       f(last_landmark, "%s%s", etype, last_message);
     else if (same_error_count > 0)
       f(last_landmark, "%s%s (%d times)", etype, last_message, same_error_count);
@@ -502,10 +521,13 @@ gifread_error(Gif_Stream* gfs, Gif_Image* gfi,
     if (last_message[0] == 0)
       different_error_count++;
     same_error_count++;
-    strcpy(last_message, message);
-    strcpy(last_landmark, landmark);
+    strncpy(last_message, message, sizeof(last_message));
+    last_message[sizeof(last_message) - 1] = 0;
+    strncpy(last_landmark, landmark, sizeof(last_landmark));
+    last_landmark[sizeof(last_landmark) - 1] = 0;
     last_is_error = is_error;
     if (different_error_count == 11) {
+      if (!(gfi && gfi->user_flags))
       error(0, "(plus more errors; is this GIF corrupt?)");
       different_error_count++;
     }
@@ -514,13 +536,16 @@ gifread_error(Gif_Stream* gfs, Gif_Image* gfi,
 
   {
     unsigned long missing;
-    if (message && sscanf(message, "missing %lu pixels", &missing) == 1
-        && missing > 10000) {
+    if (message && sscanf(message, "missing %lu pixel", &missing) == 1
+        && missing > 10000 && no_ignore_errors) {
       gifread_error(gfs, 0, -1, 0);
       lerror(landmark, "fatal error: too many missing pixels, giving up");
       exit(1);
     }
   }
+
+  if (gfi && is_error < 0)
+    gfi->user_flags |= 1;
 }
 
 struct StoredFile {
@@ -540,7 +565,7 @@ open_giffile(const char *name)
   if (name == 0 || strcmp(name, "-") == 0) {
 #ifndef OUTPUT_GIF_TO_TERMINAL
     if (isatty(fileno(stdin))) {
-      lerror("<stdin>", "is a terminal");
+      lerror("<stdin>", "Is a terminal");
       return NULL;
     }
 #endif
@@ -603,7 +628,7 @@ close_giffile(FILE *f, int final)
 void
 input_stream(const char *name)
 {
-  static char *component_namebuf = 0;
+  char* component_namebuf;
   FILE *f;
   Gif_Stream *gfs;
   int i;
@@ -636,11 +661,11 @@ input_stream(const char *name)
   /* change filename for component files */
   componentno++;
   if (componentno > 1) {
-    free(component_namebuf);
     component_namebuf = (char*) malloc(strlen(main_name) + 10);
     sprintf(component_namebuf, "%s~%d", main_name, componentno);
     name = component_namebuf;
-  }
+  } else
+    component_namebuf = 0;
 
   /* check for empty file */
   i = getc(f);
@@ -649,8 +674,7 @@ input_stream(const char *name)
       lerror(name, "empty file");
     else if (nextfile)
       lerror(name, "no more images in file");
-    close_giffile(f, 1);
-    return;
+    goto error;
   }
   ungetc(i, f);
 
@@ -670,8 +694,7 @@ input_stream(const char *name)
     Gif_DeleteStream(gfs);
     if (verbosing)
       verbose_close('>');
-    close_giffile(f, 1);
-    return;
+    goto error;
   }
 
   /* special processing for components after the first */
@@ -737,25 +760,19 @@ input_stream(const char *name)
     add_frame(frames, gfs, gfs->images[i]);
   def_frame = old_def_frame;
 
-  if (unoptimizing)
-    if (!Gif_FullUnoptimize(gfs, GIF_UNOPTIMIZE_SIMPLEST_DISPOSAL)) {
-      static int context = 0;
-      if (!context) {
-        lwarning(name, "GIF too complex to unoptimize\n"
-                 "  (The reason was local color tables or complex transparency.\n"
-                 "  Try running the GIF through %<gifsicle --colors=255%> first.)");
-        context = 1;
-      } else
-        lwarning(name, "GIF too complex to unoptimize");
-    }
-
   apply_color_transforms(input_transforms, gfs);
   gfs->refcount++;
 
   /* Read more files. */
+  free(component_namebuf);
   if ((gif_read_flags & GIF_READ_TRAILING_GARBAGE_OK) && !nextfile)
     goto retry_file;
   close_giffile(f, 0);
+  return;
+
+ error:
+  free(component_namebuf);
+  close_giffile(f, 1);
 }
 
 void
@@ -921,12 +938,12 @@ merge_and_write_frames(const char *outfile, int f1, int f2)
     || active_output_data.colormap_fixed;
   warn_local_colormaps = !colormap_change;
 
-  compress_immediately = 1;
-  if (!active_output_data.conserve_memory
-      && (active_output_data.scaling
+  if (!(active_output_data.scaling
 	  || (active_output_data.optimizing & GT_OPT_MASK)
 	  || colormap_change))
-    compress_immediately = 0;
+    compress_immediately = 1;
+  else
+    compress_immediately = active_output_data.conserve_memory;
 
   out = merge_frame_interval(frames, f1, f2, &active_output_data,
 			     compress_immediately, &huge_stream);
@@ -1156,6 +1173,7 @@ initialize_def_frame(void)
   def_frame.explode_by_name = 0;
 
   def_frame.no_extensions = 0;
+  def_frame.no_app_extensions = 0;
   def_frame.extensions = 0;
 
   def_frame.flip_horizontal = 0;
@@ -1373,6 +1391,10 @@ main(int argc, char *argv[])
   initialize_def_frame();
   Gif_InitCompressInfo(&gif_write_info);
   Gif_SetErrorHandler(gifread_error);
+
+#if ENABLE_THREADS
+  pthread_mutex_init(&kd3_sort_lock, 0);
+#endif
 
   /* Yep, I'm an idiot.
      GIF dimensions are unsigned 16-bit integers. I assume that these
@@ -1610,8 +1632,16 @@ main(int argc, char *argv[])
       def_frame.no_extensions = 1;
       break;
 
+    case NO_APP_EXTENSIONS_OPT:
+      def_frame.no_app_extensions = 1;
+      break;
+
      case SAME_EXTENSIONS_OPT:
       def_frame.no_extensions = 0;
+      break;
+
+    case SAME_APP_EXTENSIONS_OPT:
+      def_frame.no_app_extensions = 0;
       break;
 
      case EXTENSION_OPT:
@@ -1716,6 +1746,15 @@ main(int argc, char *argv[])
      case UNOPTIMIZE_OPT:
       UNCHECKED_MARK_CH(input, CH_UNOPTIMIZE);
       unoptimizing = clp->negated ? 0 : 1;
+      break;
+
+     case THREADS_OPT:
+      if (clp->negated)
+          thread_count = 0;
+      else if (clp->have_val)
+          thread_count = clp->val.i;
+      else
+          thread_count = GIFSICLE_DEFAULT_THREAD_COUNT;
       break;
 
       /* WHOLE-GIF OPTIONS */
@@ -1895,6 +1934,13 @@ main(int argc, char *argv[])
       }
       break;
 
+    case LOSSY_OPT:
+      if (clp->have_val)
+        gif_write_info.loss = clp->val.i;
+      else
+        gif_write_info.loss = 20;
+      break;
+
       /* RANDOM OPTIONS */
 
      case NO_WARNINGS_OPT:
@@ -1905,9 +1951,13 @@ main(int argc, char *argv[])
       no_warnings = clp->negated;
       break;
 
+     case IGNORE_ERRORS_OPT:
+      no_ignore_errors = clp->negated;
+      break;
+
      case CONSERVE_MEMORY_OPT:
       MARK_CH(output, CH_MEMORY);
-      def_output_data.conserve_memory = !clp->negated;
+      def_output_data.conserve_memory = clp->negated ? -1 : 1;
       break;
 
      case MULTIFILE_OPT:
@@ -1987,7 +2037,7 @@ particular purpose.\n");
 
   frame_change_done();
   input_done();
-  if (mode == MERGING || mode == INFOING)
+  if ((mode == MERGING && !error_count) || mode == INFOING)
     output_frames();
 
   verbose_endline();
